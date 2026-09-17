@@ -1,11 +1,10 @@
-﻿{
+{
   "name": "cfocr-4399",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "download": "bash scripts/download_4399.sh"
+    "deploy": "wrangler deploy"
   },
   "dependencies": {
     "onnxruntime-web": "^1.20.1"
