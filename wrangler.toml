@@ -1,0 +1,11 @@
+﻿name = "cfocr-4399"
+main = "src/index.js"
+compatibility_date = "2026-09-16"
+
+[vars]
+MODEL_URL_4399 = "https://raw.githubusercontent.com/boluoreg/4399Register/4b71346e21a23f211e2756f8ad43e7a0a5157456/4399ocr/4399ocr.onnx"
+
+[[d1_databases]]
+binding = "OCR_DB"
+database_name = "cfocr-4399"
+database_id = "REPLACE_WITH_YOUR_D1_ID"
