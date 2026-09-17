@@ -1,9 +1,32 @@
 import * as ort from "onnxruntime-web";
 
-const CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ".split("");
+/*
+ * 关键修复：
+ * ONNX Runtime 在 Cloudflare Worker 中无法自动找到 WASM 文件，
+ * 所以必须手动指定 WASM 文件所在目录。
+ */
+ort.env.wasm.wasmPaths =
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+
+ort.env.wasm.numThreads = 1;
+ort.env.wasm.proxy = false;
+
+// 4399ocr.json 中的原始字符集
+const CHARSET = [
+  " ", "6", "t", "y", "w", "J", "K", "k", "p", "7",
+  "8", "9", "n", "j", "P", "q", "D", "G", "c", "N",
+  "v", "X", "H", "Y", "5", "0", "h", "R", "f", "r",
+  "4", "d", "A", "E", "M", "l", "V", "m", "a", "F",
+  "s", "i", "z", "U", "g", "x", "u", "o", "3", "Q",
+  "b", "e", "T", "1", "2"
+];
+
+const DEFAULT_MODEL_URL =
+  "https://raw.githubusercontent.com/boluoreg/4399Register/4b71346e21a23f211e2756f8ad43e7a0a5157456/4399ocr/4399ocr.onnx";
 
 let sessionPromise = null;
 
+/* 返回 JSON */
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -16,282 +39,276 @@ function json(data, status = 200) {
   });
 }
 
-async function getSession() {
-  if (sessionPromise) return sessionPromise;
+/* 加载并缓存 ONNX 模型 */
+async function getSession(env) {
+  if (sessionPromise) {
+    return sessionPromise;
+  }
 
-  const modelUrl =
-    (typeof MODEL_URL_4399 !== "undefined" && MODEL_URL_4399)
-      ? MODEL_URL_4399
-      : "https://raw.githubusercontent.com/boluoreg/4399Register/4b71346e21a23f211e2756f8ad43e7a0a5157456/4399ocr/4399ocr.onnx";
+  const modelUrl = env.MODEL_URL_4399 || DEFAULT_MODEL_URL;
 
   sessionPromise = fetch(modelUrl)
-    .then((r) => {
-      if (!r.ok) throw new Error("下载 4399 模型失败: " + r.status);
-      return r.arrayBuffer();
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(`模型下载失败，HTTP 状态码：${response.status}`);
+      }
+
+      return response.arrayBuffer();
     })
-    .then((buf) => ort.InferenceSession.create(buf, { executionProviders: ["wasm"] }));
+    .then((modelBuffer) => {
+      return ort.InferenceSession.create(modelBuffer, {
+        executionProviders: ["wasm"]
+      });
+    });
 
   return sessionPromise;
 }
 
-async function readRequestBytes(request) {
+/* 读取上传的图片 */
+async function readImageBytes(request) {
   const contentType = request.headers.get("content-type") || "";
 
+  // multipart/form-data
   if (contentType.includes("multipart/form-data")) {
-    const form = await request.formData();
-    const file = form.get("file") || form.get("image");
+    const formData = await request.formData();
+    const file = formData.get("file") || formData.get("image");
+
     if (!file || typeof file.arrayBuffer !== "function") {
-      throw new Error("请用 form-data 的 file 字段上传图片");
+      throw new Error("没有找到图片，请使用 file 字段上传图片");
     }
+
     return file.arrayBuffer();
   }
 
+  // JSON Base64
   if (contentType.includes("application/json")) {
     const body = await request.json();
-    const raw = body.image || body.b64;
-    if (!raw) throw new Error("JSON 里需要 image 或 b64");
-    const base64 = raw.includes(",") ? raw.split(",").pop() : raw;
+    const base64Text = body.b64 || body.image;
+
+    if (!base64Text) {
+      throw new Error("JSON 请求必须包含 b64 或 image 字段");
+    }
+
+    const base64 = base64Text.includes(",")
+      ? base64Text.split(",").pop()
+      : base64Text;
+
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
+
     for (let i = 0; i < binary.length; i++) {
       bytes[i] = binary.charCodeAt(i);
     }
+
     return bytes.buffer;
   }
 
+  // 直接上传图片二进制
   return request.arrayBuffer();
 }
 
-async function preprocessImageToTensor(bytes) {
-  const bitmap = await createImageBitmap(new Blob([bytes]));
-  const baseH = 32;
-  const targetW = Math.max(32, Math.min(512, Math.round(bitmap.width * baseH / Math.max(1, bitmap.height))));
+/* 图片预处理：灰度、缩放到高度 32 */
+async function imageToTensor(imageBytes) {
+  const imageBlob = new Blob([imageBytes]);
+  const bitmap = await createImageBitmap(imageBlob);
 
-  const canvas = new OffscreenCanvas(targetW, baseH);
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  ctx.fillStyle = "white";
-  ctx.fillRect(0, 0, targetW, baseH);
-  ctx.drawImage(bitmap, 0, 0, targetW, baseH);
+  const targetHeight = 32;
 
-  const imageData = ctx.getImageData(0, 0, targetW, baseH);
-  const data = imageData.data;
+  const targetWidth = Math.max(
+    32,
+    Math.min(
+      512,
+      Math.round(
+        (bitmap.width * targetHeight) / Math.max(1, bitmap.height)
+      )
+    )
+  );
 
-  const floatData = new Float32Array(baseH * targetW);
-  for (let y = 0; y < baseH; y++) {
-    for (let x = 0; x < targetW; x++) {
-      const i = (y * targetW + x) * 4;
-      const r = data[i];
-      const g = data[i + 1];
-      const b = data[i + 2];
-      const gray = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
-      floatData[y * targetW + x] = gray;
+  const canvas = new OffscreenCanvas(targetWidth, targetHeight);
+  const context = canvas.getContext("2d", {
+    willReadFrequently: true
+  });
+
+  if (!context) {
+    throw new Error("无法创建图片处理画布");
+  }
+
+  // 白色背景
+  context.fillStyle = "#ffffff";
+  context.fillRect(0, 0, targetWidth, targetHeight);
+
+  context.drawImage(
+    bitmap,
+    0,
+    0,
+    targetWidth,
+    targetHeight
+  );
+
+  const imageData = context.getImageData(
+    0,
+    0,
+    targetWidth,
+    targetHeight
+  );
+
+  const pixels = imageData.data;
+  const floatData = new Float32Array(
+    targetWidth * targetHeight
+  );
+
+  for (let y = 0; y < targetHeight; y++) {
+    for (let x = 0; x < targetWidth; x++) {
+      const pixelIndex = (y * targetWidth + x) * 4;
+
+      const red = pixels[pixelIndex];
+      const green = pixels[pixelIndex + 1];
+      const blue = pixels[pixelIndex + 2];
+
+      // RGB 转灰度并归一化到 0~1
+      const gray =
+        (0.299 * red + 0.587 * green + 0.114 * blue) / 255;
+
+      floatData[y * targetWidth + x] = gray;
     }
   }
 
-  return new ort.Tensor("float32", floatData, [1, 1, baseH, targetW]);
+  return new ort.Tensor(
+    "float32",
+    floatData,
+    [1, 1, targetHeight, targetWidth]
+  );
 }
 
-function decodeCTC(outputTensor) {
-  const dims = outputTensor.dims.map(Number);
+/* CTC 解码 */
+function decodeOutput(outputTensor) {
+  const dimensions = outputTensor.dims.map(Number);
   const data = outputTensor.data;
 
-  let time = 0;
-  let classes = 0;
+  let time;
+  let classes;
 
-  if (dims.length === 3) {
-    [, time, classes] = dims;
-  } else if (dims.length === 2) {
-    [time, classes] = dims;
+  if (dimensions.length === 3) {
+    // [1, time, classes]
+    [, time, classes] = dimensions;
+  } else if (dimensions.length === 2) {
+    // [time, classes]
+    [time, classes] = dimensions;
   } else {
-    throw new Error("不支持的输出形状: " + dims.join("x"));
+    throw new Error(
+      `模型输出形状不支持：${dimensions.join(" x ")}`
+    );
   }
 
-  const hasExtraBlank = classes === CHARSET.length + 1;
+  /*
+   * 如果输出类别数量比字符集多 1，
+   * 说明第 0 类是 blank。
+   */
+  const hasBlankClass = classes === CHARSET.length + 1;
 
-  let prev = -1;
+  let previousIndex = -1;
   let text = "";
+  let confidenceTotal = 0;
+  let characterCount = 0;
 
   for (let t = 0; t < time; t++) {
     let bestIndex = 0;
     let bestValue = -Infinity;
 
     for (let c = 0; c < classes; c++) {
-      const idx = t * classes + c;
-      const v = Number(data[idx]);
-      if (v > bestValue) {
-        bestValue = v;
+      const value = Number(data[t * classes + c]);
+
+      if (value > bestValue) {
+        bestValue = value;
         bestIndex = c;
       }
     }
 
-    let mapped = bestIndex;
-    if (hasExtraBlank && bestIndex > 0) {
-      mapped = bestIndex - 1;
+    // CTC 重复字符只保留一次
+    if (bestIndex === previousIndex) {
+      continue;
     }
 
-    if (mapped >= CHARSET.length) continue;
-    if (mapped === prev) continue;
+    // 处理 blank 类
+    if (hasBlankClass && bestIndex === 0) {
+      previousIndex = bestIndex;
+      continue;
+    }
 
-    const ch = CHARSET[mapped];
-    if (ch === " " && prev === mapped) continue;
+    const charsetIndex = hasBlankClass
+      ? bestIndex - 1
+      : bestIndex;
 
-    text += ch;
-    prev = mapped;
+    if (
+      charsetIndex >= 0 &&
+      charsetIndex < CHARSET.length
+    ) {
+      text += CHARSET[charsetIndex];
+      characterCount++;
+
+      // 将 logits 粗略转换为 0~1 的数值
+      const probability =
+        bestValue >= 0 && bestValue <= 1
+          ? bestValue
+          : 1 / (1 + Math.exp(-bestValue));
+
+      confidenceTotal += probability;
+    }
+
+    previousIndex = bestIndex;
   }
 
+  const cleanText = text.trim();
+
   return {
-    text: text.trim(),
-    confidence: text ? 0.92 : 0
+    text: cleanText,
+    confidence: characterCount > 0
+      ? Number((confidenceTotal / characterCount).toFixed(4))
+      : 0
   };
 }
 
+/* 保存到 D1，可选 */
 async function saveToD1(env, result) {
-  if (!env || !env.OCR_DB) return null;
+  if (!env.OCR_DB) {
+    return null;
+  }
 
   try {
-    const sql = `
-      INSERT INTO results (id, created_at, text_result, confidence, model)
-      VALUES (?, ?, ?, ?, ?)
-    `;
-
-    const res = await env.OCR_DB.prepare(sql)
-      .bind(crypto.randomUUID(), new Date().toISOString(), result.text, result.confidence, "4399ocr")
+    await env.OCR_DB
+      .prepare(
+        `INSERT INTO results
+        (id, created_at, text_result, confidence, model)
+        VALUES (?, ?, ?, ?, ?)`
+      )
+      .bind(
+        crypto.randomUUID(),
+        new Date().toISOString(),
+        result.text,
+        result.confidence,
+        "4399ocr"
+      )
       .run();
 
-    return { ok: true, meta: res };
-  } catch (err) {
-    return { ok: false, error: err.message };
+    return {
+      ok: true
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message
+    };
   }
 }
 
-const PAGE_HTML = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>4399 OCR</title>
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: #f3f3f3;
-      font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
-      color: #111;
-    }
-    .box {
-      max-width: 980px;
-      margin: 60px auto;
-      padding: 32px;
-      background: #fff;
-      border-radius: 12px;
-      box-shadow: 0 8px 20px rgba(0,0,0,0.04);
-    }
-    h1 {
-      font-size: 64px;
-      margin: 0 0 20px 0;
-      font-weight: 700;
-    }
-    p {
-      font-size: 28px;
-      line-height: 1.6;
-      margin: 0 0 28px 0;
-    }
-    .row {
-      display: flex;
-      align-items: center;
-      gap: 20px;
-      margin-top: 20px;
-    }
-    input[type=file] {
-      font-size: 20px;
-    }
-    button {
-      font-size: 20px;
-      padding: 10px 18px;
-      cursor: pointer;
-    }
-    img {
-      max-width: 100%;
-      max-height: 260px;
-      display: block;
-      margin-top: 16px;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-    }
-    pre {
-      margin-top: 20px;
-      background: #f8f9fa;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      padding: 16px;
-      white-space: pre-wrap;
-      font-size: 20px;
-      line-height: 1.5;
-    }
-  </style>
-</head>
-<body>
-  <div class="box">
-    <h1>4399 OCR</h1>
-    <p>上传图片后直接识别，支持 API 和网页直接使用</p>
-
-    <div class="row">
-      <input id="file" type="file" accept="image/*">
-      <button id="go">开始识别</button>
-    </div>
-
-    <img id="preview" alt="preview" hidden>
-
-    <pre id="output">等待上传图片…</pre>
-  </div>
-
-  <script>
-    const fileInput = document.getElementById("file");
-    const preview = document.getElementById("preview");
-    const output = document.getElementById("output");
-
-    fileInput.addEventListener("change", () => {
-      const file = fileInput.files[0];
-      if (!file) return;
-      preview.src = URL.createObjectURL(file);
-      preview.hidden = false;
-    });
-
-    document.getElementById("go").addEventListener("click", async () => {
-      const file = fileInput.files[0];
-      if (!file) {
-        output.textContent = "请先选择图片";
-        return;
-      }
-
-      output.textContent = "识别中...";
-      const form = new FormData();
-      form.append("file", file);
-
-      try {
-        const r = await fetch("/api/ocr", { method: "POST", body: form });
-        const data = await r.json();
-        if (!r.ok || !data.ok) {
-          throw new Error(data.error || "识别失败");
-        }
-        output.textContent =
-          "识别结果：\\n" +
-          data.result.text +
-          "\\n\\n置信度：" +
-          (data.result.confidence || 0).toFixed(2);
-      } catch (e) {
-        output.textContent = "识别失败：" + e.message;
-      }
-    });
-  </script>
-</body>
-</html>`;
-
+/*
+ * Worker
+ */
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // 处理跨域预检请求
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -303,46 +320,98 @@ export default {
       });
     }
 
-    if (url.pathname === "/api/health") {
-      return json({ ok: true, model: "4399ocr" });
+    // 健康检查
+    if (
+      url.pathname === "/api/health" &&
+      request.method === "GET"
+    ) {
+      return json({
+        ok: true,
+        model: "4399ocr",
+        wasm: "configured"
+      });
     }
 
-    if (url.pathname === "/api/ocr" && request.method === "POST") {
+    // OCR API
+    if (
+      url.pathname === "/api/ocr" &&
+      request.method === "POST"
+    ) {
       try {
-        const bytes = await readRequestBytes(request);
+        const imageBytes = await readImageBytes(request);
 
-        if (!bytes.byteLength || bytes.byteLength > 8 * 1024 * 1024) {
-          return json({ ok: false, error: "图片必须是 1 byte ~ 8 MB 之间" }, 400);
+        if (!imageBytes || imageBytes.byteLength === 0) {
+          return json(
+            {
+              ok: false,
+              error: "图片为空"
+            },
+            400
+          );
         }
 
-        const session = await getSession();
-        const inputTensor = await preprocessImageToTensor(bytes);
+        if (imageBytes.byteLength > 8 * 1024 * 1024) {
+          return json(
+            {
+              ok: false,
+              error: "图片不能超过 8 MB"
+            },
+            400
+          );
+        }
+
+        const session = await getSession(env);
+        const inputTensor = await imageToTensor(imageBytes);
 
         const inputName = session.inputNames[0];
-        const outputs = await session.run({ [inputName]: inputTensor });
-        const firstKey = Object.keys(outputs)[0];
-        const result = decodeCTC(outputs[firstKey]);
 
-        const d1Res = await saveToD1(env, result);
+        if (!inputName) {
+          throw new Error("模型没有找到输入名称");
+        }
+
+        const outputs = await session.run({
+          [inputName]: inputTensor
+        });
+
+        const outputNames = Object.keys(outputs);
+
+        if (outputNames.length === 0) {
+          throw new Error("模型没有返回输出");
+        }
+
+        const outputTensor = outputs[outputNames[0]];
+        const result = decodeOutput(outputTensor);
+        const d1 = await saveToD1(env, result);
 
         return json({
           ok: true,
           model: "4399ocr",
           result,
-          d1: d1Res
+          d1
         });
-      } catch (err) {
-        return json({ ok: false, error: err.message }, 500);
+      } catch (error) {
+        return json(
+          {
+            ok: false,
+            error: error.message
+          },
+          500
+        );
       }
     }
 
-    if (url.pathname === "/" || url.pathname === "/index.html") {
-      return new Response(PAGE_HTML, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store"
+    // 根路径提示
+    if (url.pathname === "/") {
+      return new Response(
+        "4399 OCR API is running. Use POST /api/ocr.",
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/plain; charset=utf-8",
+            "cache-control": "no-store"
+          }
         }
-      });
+      );
     }
 
     return json({
