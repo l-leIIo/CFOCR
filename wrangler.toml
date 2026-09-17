@@ -8,4 +8,4 @@ MODEL_URL_4399 = "https://raw.githubusercontent.com/boluoreg/4399Register/4b7134
 [[d1_databases]]
 binding = "OCR_DB"
 database_name = "cfocr-4399"
-database_id = "REPLACE_WITH_YOUR_D1_ID"
+database_id = "848046d4-4f5c-4758-9227-cc3147c1d312"
